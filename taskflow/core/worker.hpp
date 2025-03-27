@@ -102,7 +102,7 @@ class Worker {
     Executor* _executor {nullptr};
     DefaultNotifier::Waiter* _waiter;
     std::thread _thread;
-    
+    pthread_t _pthread;  // thread handler
     std::default_random_engine _rdgen;
     std::uniform_int_distribution<size_t> _udist;
 

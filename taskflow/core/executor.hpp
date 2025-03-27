@@ -79,6 +79,12 @@ class Executor {
     std::shared_ptr<WorkerInterface> wix = nullptr
   );
 
+  explicit Executor(
+    size_t stack_size,
+    size_t N = std::thread::hardware_concurrency(),
+    std::shared_ptr<WorkerInterface> wix = nullptr
+  );
+
   /**
   @brief destructs the executor
 
@@ -1049,7 +1055,7 @@ class Executor {
   private:
     
   std::mutex _taskflows_mutex;
-  
+  size_t _stack_size;
   std::vector<Worker> _workers;
   DefaultNotifier _notifier;
 
@@ -1127,6 +1133,58 @@ class Executor {
   template <typename P, typename F>
   void _silent_async(P&&, F&&, Topology*, Node*);
 
+  void _run_worker(Worker& w) {
+    pt::this_worker = &w;
+    // synchronize with the main thread to ensure all worker data has been set
+    //_latch.arrive_and_wait(); 
+    
+    // initialize the random engine and seed for work-stealing loop
+    w._rdgen.seed(static_cast<std::default_random_engine::result_type>(
+      std::hash<std::thread::id>()(std::this_thread::get_id()))
+    );
+    //w._udist = std::uniform_int_distribution<size_t>(0, _workers.size() - 1);
+    w._udist = std::uniform_int_distribution<size_t>(0, _workers.size() + _buffers.size() - 2);
+
+    // before entering the work-stealing loop, call the scheduler prologue
+    if(_worker_interface) {
+      _worker_interface->scheduler_prologue(w);
+    }
+
+    Node* t = nullptr;
+    std::exception_ptr ptr = nullptr;
+
+    // must use 1 as condition instead of !done because
+    // the previous worker may stop while the following workers
+    // are still preparing for entering the scheduling loop
+    try {
+
+      // worker loop
+      while(1) {
+
+        // drain out the local queue
+        _exploit_task(w, t);
+
+        // steal and wait for tasks
+        if(_wait_for_task(w, t) == false) {
+          break;
+        }
+      }
+    } 
+    catch(...) {
+      ptr = std::current_exception();
+    }
+    
+    // call the user-specified epilogue function
+    if(_worker_interface) {
+      _worker_interface->scheduler_epilogue(w, ptr);
+    }
+  }
+  static void* thread_entry(void* arg) {
+    Worker* w = static_cast<Worker*>(arg);
+    w->_executor->_run_worker(*w);
+    return nullptr;
+  }
+
 };
 
 #ifndef DOXYGEN_GENERATING_OUTPUT
@@ -1137,6 +1195,7 @@ inline Executor::Executor(size_t N, std::shared_ptr<WorkerInterface> wix) :
   _notifier        (N),
   //_latch           (N+1),
   _buffers        (N),
+  _stack_size     (8*1024*1024),
   _worker_interface(std::move(wix)) {
 
   if(N == 0) {
@@ -1150,6 +1209,27 @@ inline Executor::Executor(size_t N, std::shared_ptr<WorkerInterface> wix) :
     TFProfManager::get()._manage(make_observer<TFProfObserver>());
   }
 }
+
+inline Executor::Executor(size_t stack_size, size_t N, std::shared_ptr<WorkerInterface> wix):
+  _workers         (N),
+  _notifier        (N),
+  //_latch           (N+1),
+  _buffers        (N),
+  _stack_size(stack_size),
+  _worker_interface(std::move(wix)) {
+
+  if(N == 0) {
+    TF_THROW("executor must define at least one worker");
+  }
+
+  _spawn(N);
+
+  // initialize the default observer if requested
+  if(has_env(TF_ENABLE_PROFILER)) {
+    TFProfManager::get()._manage(make_observer<TFProfObserver>());
+  }
+}
+
 
 // Destructor
 inline Executor::~Executor() {
@@ -1168,8 +1248,11 @@ inline Executor::~Executor() {
 
   _notifier.notify_all();
 
+  // for(auto& w : _workers) {
+  //   w._thread.join();
+  // }
   for(auto& w : _workers) {
-    w._thread.join();
+    pthread_join(w._pthread, nullptr);
   }
 }
 
@@ -1208,7 +1291,6 @@ inline int Executor::this_worker_id() const {
   auto w = pt::this_worker;
   return (w && w->_executor == this) ? static_cast<int>(w->_id) : -1;
 }
-
 // Procedure: _spawn
 inline void Executor::_spawn(size_t N) {
 
@@ -1221,55 +1303,75 @@ inline void Executor::_spawn(size_t N) {
     _workers[id]._vtm = id;
     _workers[id]._executor = this;
     _workers[id]._waiter = &_notifier._waiters[id];
-    _workers[id]._thread = std::thread([&, &w=_workers[id]] () {
 
-      pt::this_worker = &w;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, _stack_size); // 设置栈为 8MB，可自行调整
 
-      // synchronize with the main thread to ensure all worker data has been set
-      //_latch.arrive_and_wait(); 
+    Worker* wptr = &_workers[id];
+    wptr->_id = id;
+    wptr->_vtm = id;
+    wptr->_executor = this;
+    wptr->_waiter = &_notifier._waiters[id];
+
+    pthread_t tid;
+    pthread_create(&tid, &attr, &Executor::thread_entry, wptr);
+    wptr->_pthread = tid;
+
+    pthread_attr_destroy(&attr);
+
+    size_t stack_size;
+    pthread_attr_getstacksize(&attr, &stack_size);
+    std::cerr << "[Creat Executor]Stack size = " << stack_size << std::endl;
+    // _workers[id]._thread = std::thread([&, &w=_workers[id]] () {
+
+    //   pt::this_worker = &w;
+
+    //   // synchronize with the main thread to ensure all worker data has been set
+    //   //_latch.arrive_and_wait(); 
       
-      // initialize the random engine and seed for work-stealing loop
-      w._rdgen.seed(static_cast<std::default_random_engine::result_type>(
-        std::hash<std::thread::id>()(std::this_thread::get_id()))
-      );
-      //w._udist = std::uniform_int_distribution<size_t>(0, _workers.size() - 1);
-      w._udist = std::uniform_int_distribution<size_t>(0, _workers.size() + _buffers.size() - 2);
+    //   // initialize the random engine and seed for work-stealing loop
+    //   w._rdgen.seed(static_cast<std::default_random_engine::result_type>(
+    //     std::hash<std::thread::id>()(std::this_thread::get_id()))
+    //   );
+    //   //w._udist = std::uniform_int_distribution<size_t>(0, _workers.size() - 1);
+    //   w._udist = std::uniform_int_distribution<size_t>(0, _workers.size() + _buffers.size() - 2);
 
-      // before entering the work-stealing loop, call the scheduler prologue
-      if(_worker_interface) {
-        _worker_interface->scheduler_prologue(w);
-      }
+    //   // before entering the work-stealing loop, call the scheduler prologue
+    //   if(_worker_interface) {
+    //     _worker_interface->scheduler_prologue(w);
+    //   }
 
-      Node* t = nullptr;
-      std::exception_ptr ptr = nullptr;
+    //   Node* t = nullptr;
+    //   std::exception_ptr ptr = nullptr;
 
-      // must use 1 as condition instead of !done because
-      // the previous worker may stop while the following workers
-      // are still preparing for entering the scheduling loop
-      try {
+    //   // must use 1 as condition instead of !done because
+    //   // the previous worker may stop while the following workers
+    //   // are still preparing for entering the scheduling loop
+    //   try {
 
-        // worker loop
-        while(1) {
+    //     // worker loop
+    //     while(1) {
 
-          // drain out the local queue
-          _exploit_task(w, t);
+    //       // drain out the local queue
+    //       _exploit_task(w, t);
 
-          // steal and wait for tasks
-          if(_wait_for_task(w, t) == false) {
-            break;
-          }
-        }
-      } 
-      catch(...) {
-        ptr = std::current_exception();
-      }
+    //       // steal and wait for tasks
+    //       if(_wait_for_task(w, t) == false) {
+    //         break;
+    //       }
+    //     }
+    //   } 
+    //   catch(...) {
+    //     ptr = std::current_exception();
+    //   }
       
-      // call the user-specified epilogue function
-      if(_worker_interface) {
-        _worker_interface->scheduler_epilogue(w, ptr);
-      }
+    //   // call the user-specified epilogue function
+    //   if(_worker_interface) {
+    //     _worker_interface->scheduler_epilogue(w, ptr);
+    //   }
 
-    });
+    // });
   } 
 
   //_latch.arrive_and_wait();

@@ -10,6 +10,9 @@
 
 Taskflow helps you quickly write parallel and heterogeneous task programs in modern C++
 
+# Change of this fork
+This fork modified the ```tf::Executor``` class. One can not customize the stack size of each thread, this can avoid some stack overflow errors of memory expensive codes. The default stack size is 8 M. You can use the new constructor ```tf::Executor::Executor([stack size], [number of threads])``` to customize the stack size.
+
 # Why Taskflow?
 
 Taskflow is faster, more expressive, and easier for drop-in integration
